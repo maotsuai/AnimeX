@@ -1,3 +1,6 @@
+# Local release artifacts produced by manual cross-compile / packaging
+release-artifacts/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -14,8 +17,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -67,9 +70,6 @@ instance/
 
 # Scrapy stuff:
 .scrapy
-
-# Documentation
-docs/
 
 # PyBuilder
 .pybuilder/
@@ -175,3 +175,9 @@ docker-data/
 # Keep Go source package tracked despite local torrent cache ignore
 !internal/torrent/
 !internal/torrent/**
+
+# uiautomator2 smoke test debug artifacts
+mobile/scripts/u2_screenshots/
+
+# Local docker-compose overrides (developer-specific)
+docker-compose.override.yml

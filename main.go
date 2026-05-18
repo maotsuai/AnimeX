@@ -26,6 +26,8 @@ import (
 	"bangumi-pikpak/internal/web"
 )
 
+var appVersion = "dev"
+
 func main() {
 	configDBPath := flag.String("configdb", config.DefaultLocalDBPath, "path to local SQLite config database")
 	intervalSeconds := flag.Int("interval", 600, "RSS polling interval in seconds")
@@ -78,7 +80,7 @@ func main() {
 		if *webMode {
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			webServer := web.Server{Config: cfg, ConfigDBPath: *configDBPath, LocalDB: localDB, InstallOnly: true, HTTPClient: http.DefaultClient, Logger: log, TorrentRoot: "torrent", StaticDir: *staticDir}
+			webServer := web.Server{Config: cfg, ConfigDBPath: *configDBPath, LocalDB: localDB, InstallOnly: true, HTTPClient: http.DefaultClient, Logger: log, TorrentRoot: "torrent", StaticDir: *staticDir, Version: appVersion}
 			httpServer := &http.Server{Addr: *addr, Handler: webServer.Handler()}
 			errCh := make(chan error, 1)
 			go func() {
@@ -131,44 +133,14 @@ func main() {
 		log.Error("create storage provider failed", "provider", cfg.NormalizedStorageProvider(), "error", err)
 		os.Exit(1)
 	}
-	staticRunner := app.Runner{Config: cfg, HTTPClient: proxy.HTTPClient(), Logger: log, TorrentRoot: "torrent", PikPak: pp, Storage: storageProvider, Store: mysqlStore}
-	runnerFactory := func() app.Runner { return staticRunner }
+	runner := app.Runner{Config: cfg, HTTPClient: proxy.HTTPClient(), Logger: log, TorrentRoot: "torrent", PikPak: pp, Storage: storageProvider, Store: mysqlStore}
+	scheduler := &syncScheduler{runner: runner, log: log}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pollerTrigger := make(chan struct{}, 1)
-	if !*once && pp != nil && mysqlStore != nil {
-		poller := app.Poller{
-			PikPak:         pp,
-			Provider:       storageProvider,
-			Store:          mysqlStore,
-			Logger:         log,
-			Interval:       30 * time.Second,
-			MaxRetries:     cfg.PikPakOfflineRetryCount,
-			MaxRetriesFunc: func() int { return localDBPikPakRetryCount(localDB, cfg.PikPakOfflineRetryCount) },
-			Trigger:        pollerTrigger,
-		}
-		go poller.Loop(ctx)
-		log.Info("pikpak poller started", "interval", "30s", "max_retries", cfg.PikPakOfflineRetryCount)
-	}
-
 	if *webMode {
-		runtimeState := web.NewRuntimeState(cfg, true, false, proxy.HTTPClient(), pp, storageProvider, mysqlStore, redisCache)
-		runtimeState.PollerTrigger = pollerTrigger
-		// Live-config-aware factory: the web admin endpoints call reloadRuntime
-		// which atomically swaps cfg/pp/storage/store on runtimeState, so each
-		// scheduler tick observes the latest values without a process restart.
-		runnerFactory = func() app.Runner {
-			liveCfg, _, _, liveHC, liveWebPP, liveStorage, liveStore, _ := runtimeState.Snapshot()
-			var livePP app.PikPakClient
-			if liveWebPP != nil {
-				livePP, _ = liveWebPP.(app.PikPakClient)
-			}
-			return app.Runner{Config: liveCfg, HTTPClient: liveHC, Logger: log, TorrentRoot: "torrent", PikPak: livePP, Storage: liveStorage, Store: liveStore}
-		}
-		webServer := web.Server{Runtime: runtimeState, Config: cfg, ConfigDBPath: *configDBPath, LocalDB: localDB, HTTPClient: proxy.HTTPClient(), Logger: log, TorrentRoot: "torrent", StaticDir: *staticDir, PikPak: pp, Storage: storageProvider, Store: mysqlStore, Cache: redisCache, PollerTrigger: pollerTrigger}
-		scheduler := &syncScheduler{runnerFactory: runnerFactory, log: log}
+		webServer := web.Server{Config: cfg, ConfigDBPath: *configDBPath, LocalDB: localDB, HTTPClient: proxy.HTTPClient(), Logger: log, TorrentRoot: "torrent", StaticDir: *staticDir, PikPak: pp, Storage: storageProvider, Store: mysqlStore, Cache: redisCache, Version: appVersion}
 		httpServer := &http.Server{Addr: *addr, Handler: webServer.Handler()}
 		errCh := make(chan error, 1)
 		go func() {
@@ -177,10 +149,11 @@ func main() {
 				errCh <- err
 			}
 		}()
-		if !*once {
+		if !*once && strings.TrimSpace(cfg.RSS) != "" {
 			interval := time.Duration(*intervalSeconds) * time.Second
 			go scheduler.Loop(ctx, interval, 15*time.Second)
-			log.Info("RSS scheduler started", "interval", interval.String())
+		} else if strings.TrimSpace(cfg.RSS) == "" {
+			log.Info("RSS scheduler disabled because RSS is not configured")
 		}
 		select {
 		case <-ctx.Done():
@@ -197,23 +170,22 @@ func main() {
 		return
 	}
 
-	headlessScheduler := &syncScheduler{runnerFactory: runnerFactory, log: log}
 	if *once {
-		if !headlessScheduler.Run(ctx) {
+		if !scheduler.Run(ctx) {
 			os.Exit(1)
 		}
 		return
 	}
 
 	interval := time.Duration(*intervalSeconds) * time.Second
-	headlessScheduler.Loop(ctx, interval, 0)
+	scheduler.Loop(ctx, interval, 0)
 }
 
 type syncScheduler struct {
-	mu            sync.Mutex
-	running       bool
-	runnerFactory func() app.Runner
-	log           *slog.Logger
+	mu      sync.Mutex
+	running bool
+	runner  app.Runner
+	log     *slog.Logger
 }
 
 func (s *syncScheduler) Run(ctx context.Context) bool {
@@ -231,16 +203,7 @@ func (s *syncScheduler) Run(ctx context.Context) bool {
 		s.mu.Unlock()
 	}()
 
-	runner := s.runnerFactory()
-	if strings.TrimSpace(runner.Config.RSS) == "" {
-		s.log.Debug("skip RSS sync, RSS not configured")
-		return true
-	}
-	if runner.Storage == nil {
-		s.log.Debug("skip RSS sync, storage provider not initialized")
-		return true
-	}
-	if err := runner.RunOnce(ctx); err != nil {
+	if err := s.runner.RunOnce(ctx); err != nil {
 		s.log.Error("sync cycle failed", "error", err)
 		return false
 	}
@@ -448,23 +411,6 @@ func randomSecret(length int) string {
 	return string(buf)
 }
 
-// localDBPikPakRetryCount reads the latest pikpak_offline_retry_count out of
-// the persisted config so the running Poller picks up admin changes without
-// a restart. Falls back to fallback when the DB is unavailable.
-func localDBPikPakRetryCount(localDB *config.LocalDB, fallback int) int {
-	if localDB == nil {
-		return fallback
-	}
-	cfg, ok, err := localDB.LoadConfig(context.Background())
-	if err != nil || !ok {
-		return fallback
-	}
-	if cfg.PikPakOfflineRetryCount < 0 {
-		return 0
-	}
-	return cfg.PikPakOfflineRetryCount
-}
-
 func loadPikPakStateFromDB(localDB *config.LocalDB) (config.PikPakState, bool, error) {
 	if localDB == nil {
 		return config.PikPakState{}, false, nil
@@ -595,46 +541,6 @@ func (l *lockedPikPak) DownloadURL(id string) (string, error) {
 		l.saveTokenStateLocked()
 	}
 	return u, err
-}
-
-func (l *lockedPikPak) OfflineTasks(maxTasks int) ([]pikpak.RemoteOfflineTask, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	tasks, err := l.inner.OfflineTasks(maxTasks)
-	if err == nil {
-		l.saveTokenStateLocked()
-	}
-	return tasks, err
-}
-
-func (l *lockedPikPak) RetryOffline(taskID string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	err := l.inner.RetryOffline(taskID)
-	if err == nil {
-		l.saveTokenStateLocked()
-	}
-	return err
-}
-
-func (l *lockedPikPak) FileMeta(id string) (pikpak.RemoteFile, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	file, err := l.inner.FileMeta(id)
-	if err == nil {
-		l.saveTokenStateLocked()
-	}
-	return file, err
-}
-
-func (l *lockedPikPak) RenameRemote(id, newName string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	err := l.inner.RenameRemote(id, newName)
-	if err == nil {
-		l.saveTokenStateLocked()
-	}
-	return err
 }
 
 func (l *lockedPikPak) saveTokenStateLocked() {
