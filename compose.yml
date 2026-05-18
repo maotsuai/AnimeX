@@ -1,0 +1,71 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: animex-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-animex}
+      MYSQL_USER: ${MYSQL_USER:-animex}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set in .env}
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - ${MYSQL_DATA_DIR:-./docker-data/mysql}:/var/lib/mysql
+    ports:
+      - "${MYSQL_BIND_ADDR:-127.0.0.1}:${MYSQL_HOST_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: animex-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ${REDIS_DATA_DIR:-./docker-data/redis}:/data
+    ports:
+      - "${REDIS_BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  animex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${ANIMEX_IMAGE_TAG:-animex:local}
+    container_name: animex
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      ANIMEX_AUTO_INSTALL: "true"
+      ANIMEX_SKIP_DB_INSTALL_STEPS: "true"
+      ANIMEX_ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ANIMEX_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set in .env}
+      ANIMEX_MYSQL_HOST: mysql
+      ANIMEX_MYSQL_PORT: "3306"
+      ANIMEX_MYSQL_DATABASE: ${MYSQL_DATABASE:-animex}
+      ANIMEX_MYSQL_USERNAME: ${MYSQL_USER:-animex}
+      ANIMEX_MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set in .env}
+      ANIMEX_REDIS_ADDR: redis:6379
+      ANIMEX_REDIS_DB: "0"
+      ANIMEX_STORAGE_PROVIDER: ${ANIMEX_STORAGE_PROVIDER:-pikpak}
+      ANIMEX_LOCAL_STORAGE_PATH: /app/data/downloads
+    ports:
+      - "${ANIMEX_BIND_ADDR:-0.0.0.0}:${ANIMEX_HOST_PORT:-8080}:8080"
+    volumes:
+      - ${ANIMEX_DATA_DIR:-./docker-data/animex}:/app/data

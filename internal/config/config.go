@@ -47,6 +47,10 @@ type Config struct {
 	Aria2RPCSecret         string `json:"aria2_rpc_secret"`
 	LocalStoragePath       string `json:"local_storage_path"`
 	NASStoragePath         string `json:"nas_storage_path"`
+	// PikPakOfflineRetryCount is the maximum number of times the Poller will
+	// retry a PikPak offline task before marking the episode as failed.
+	// 0 = no retry, terminal on first ERROR. Default 1.
+	PikPakOfflineRetryCount int `json:"pikpak_offline_retry_count"`
 }
 
 func Default() Config {
@@ -69,6 +73,7 @@ func Default() Config {
 		Drive115RootCID:        "0",
 		Aria2RPCURL:            "http://127.0.0.1:6800/jsonrpc",
 		LocalStoragePath:       "downloads",
+		PikPakOfflineRetryCount: 1,
 	}
 }
 

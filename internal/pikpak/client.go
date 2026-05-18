@@ -31,6 +31,17 @@ type RemoteTask struct {
 	Name string
 }
 
+// RemoteOfflineTask is the trimmed-down view of pikpakgo.Task we use for
+// the Poller. Phase values are the PHASE_TYPE_* constants from the SDK.
+type RemoteOfflineTask struct {
+	ID       string
+	Name     string
+	FileID   string // populated when Phase == COMPLETE
+	Phase    string
+	Message  string
+	Progress int
+}
+
 type API interface {
 	Login() error
 	FileListAll(parentID string) ([]RemoteFile, error)
@@ -39,6 +50,10 @@ type API interface {
 	GetDownloadUrl(id string) (string, error)
 	BatchDeleteFiles(ids []string) error
 	Tokens() TokenPair
+	OfflineList(limit int, pageToken string) (*pikpakgo.TaskList, error)
+	OfflineRetry(taskID string) error
+	GetFile(id string) (RemoteFile, error)
+	RenameFile(id, name string) (RemoteFile, error)
 }
 
 type Adapter struct {
@@ -117,6 +132,79 @@ func (a *Adapter) DeleteFile(id string) error {
 		return fmt.Errorf("pikpak file id is empty")
 	}
 	return a.api.BatchDeleteFiles([]string{id})
+}
+
+// OfflineTasks pages through the PikPak offline-task list and returns up to
+// maxTasks entries flattened into our RemoteOfflineTask shape.
+func (a *Adapter) OfflineTasks(maxTasks int) ([]RemoteOfflineTask, error) {
+	if maxTasks <= 0 {
+		maxTasks = 100
+	}
+	const pageSize = 100
+	pageToken := ""
+	out := make([]RemoteOfflineTask, 0, maxTasks)
+	for len(out) < maxTasks {
+		list, err := a.api.OfflineList(pageSize, pageToken)
+		if err != nil {
+			return nil, fmt.Errorf("list pikpak offline tasks: %w", err)
+		}
+		if list == nil {
+			break
+		}
+		for _, t := range list.Tasks {
+			if t == nil {
+				continue
+			}
+			out = append(out, RemoteOfflineTask{
+				ID:       t.ID,
+				Name:     t.Name,
+				FileID:   t.FileID,
+				Phase:    t.Phase,
+				Message:  t.Message,
+				Progress: t.Progress,
+			})
+			if len(out) >= maxTasks {
+				break
+			}
+		}
+		if list.NextPageToken == "" {
+			break
+		}
+		pageToken = list.NextPageToken
+	}
+	return out, nil
+}
+
+// RetryOffline asks PikPak to retry a failed offline task in place.
+func (a *Adapter) RetryOffline(taskID string) error {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return fmt.Errorf("pikpak task id is empty")
+	}
+	return a.api.OfflineRetry(taskID)
+}
+
+// FileMeta returns metadata for a single PikPak file.
+func (a *Adapter) FileMeta(id string) (RemoteFile, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return RemoteFile{}, fmt.Errorf("pikpak file id is empty")
+	}
+	return a.api.GetFile(id)
+}
+
+// RenameRemote renames a PikPak file in place. Used to suffix broken files
+// with .bad after a health check fails.
+func (a *Adapter) RenameRemote(id, newName string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("pikpak file id is empty")
+	}
+	if strings.TrimSpace(newName) == "" {
+		return fmt.Errorf("pikpak new name is empty")
+	}
+	_, err := a.api.RenameFile(id, newName)
+	return err
 }
 
 type GoAPI struct {
@@ -258,4 +346,50 @@ func (g *GoAPI) GetDownloadUrl(id string) (string, error) {
 
 func (g *GoAPI) BatchDeleteFiles(ids []string) error {
 	return g.client.BatchDeleteFiles(ids)
+}
+
+func (g *GoAPI) OfflineList(limit int, pageToken string) (*pikpakgo.TaskList, error) {
+	return g.client.OfflineList(limit, pageToken)
+}
+
+func (g *GoAPI) OfflineRetry(taskID string) error {
+	return g.client.OfflineRetry(taskID)
+}
+
+func (g *GoAPI) GetFile(id string) (RemoteFile, error) {
+	file, err := g.client.GetFile(id)
+	if err != nil {
+		return RemoteFile{}, err
+	}
+	if file == nil {
+		return RemoteFile{}, fmt.Errorf("pikpak file %s not found", id)
+	}
+	rf := RemoteFile{
+		ID:             file.ID,
+		Name:           file.Name,
+		Kind:           file.Kind,
+		OriginalURL:    file.OriginalURL,
+		ParentID:       file.ParentID,
+		Size:           file.Size,
+		MimeType:       file.MimeType,
+		FileCategory:   file.FileCategory,
+		FileExtension:  file.FileExtension,
+		ThumbnailLink:  file.ThumbnailLink,
+		WebContentLink: file.WebContentLink,
+	}
+	if file.Params != nil {
+		rf.ParamURL = file.Params.URL
+	}
+	return rf, nil
+}
+
+func (g *GoAPI) RenameFile(id, name string) (RemoteFile, error) {
+	file, err := g.client.RenameFile(id, name)
+	if err != nil {
+		return RemoteFile{}, err
+	}
+	if file == nil {
+		return RemoteFile{}, nil
+	}
+	return RemoteFile{ID: file.ID, Name: file.Name, Kind: file.Kind}, nil
 }

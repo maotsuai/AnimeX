@@ -9,6 +9,11 @@ const {
   adminOverview, formatStorage, adminUsers, adminSavingUser, adminUserForm, saveAdminUser,
   adminInvites, adminInviteLoading, generateInviteCodes, deleteInviteCodes,
   adminAnime, adminDownloadRequests, approveDownloadRequest, placeholder, adminLogs, adminConfigForm, saveAdminConfig, adminConfigSaving, deleteAdminAnime, deleteAdminEpisode,
+  discoveringRSS, discoverMikanRSS,
+  failedEpisodes, failedEpisodesLoading, failedEpisodesRetrying, failedEpisodesRetryingRow,
+  retryFailedEpisode, retryAllFailedEpisodes,
+  refreshingPikPak, refreshPikPakNow,
+  syncRSS, syncing,
   adminMonitor, statusText, goHome, authUser, logout, openPasswordModal, scanLibrary, loading,
 } = ctx
 
@@ -165,6 +170,7 @@ async function confirmDeleteEpisode() {
         <button :class="{ active: adminAnimeTab === 'list' }" @click="switchAdminAnimeTab('list')">番剧列表</button>
         <button :class="{ active: adminAnimeTab === 'requests' }" @click="switchAdminAnimeTab('requests')">下载申请</button>
       </div>
+      <button :class="{ active: adminTab === 'failed' }" @click="switchAdminTab('failed')"><span>⚠</span>失败任务<i v-if="failedEpisodes.length" class="admin-side-badge">{{ failedEpisodes.length }}</i><i v-else>⌄</i></button>
       <button :class="{ active: adminTab === 'logs' }" @click="switchAdminTab('logs')"><span>▤</span>日志管理<i>⌄</i></button>
       <button :class="{ active: adminTab === 'monitor' }" @click="switchAdminTab('monitor')"><span>◈</span>系统监控<i>⌄</i></button>
       <button :class="{ active: adminTab === 'config' }" @click="switchAdminTab('config')"><span>⚙</span>系统设置<i>⌄</i></button>
@@ -218,6 +224,7 @@ async function confirmDeleteEpisode() {
     <section class="admin-quick-panel">
       <div class="section-title"><h2>快捷操作</h2></div>
       <div class="admin-quick-grid">
+        <button :disabled="syncing" @click="syncRSS"><b>↻</b>{{ syncing ? '同步中...' : '立即同步 RSS' }}</button>
         <button @click="switchAdminTab('users')"><b>＋</b>添加用户</button>
         <button @click="switchAdminTab('storage')"><b>▱</b>储存桶配置</button>
         <button @click="switchAdminTab('anime')"><b>▦</b>番剧管理</button>
@@ -370,6 +377,11 @@ async function confirmDeleteEpisode() {
           <label><span>Access Token</span><input v-model.trim="adminConfigForm.pikpak_access_token" placeholder="token 模式可填" /></label>
           <label><span>Refresh Token</span><input v-model.trim="adminConfigForm.pikpak_refresh_token" placeholder="token 模式可填" /></label>
           <label class="wide"><span>Encoded Token</span><input v-model.trim="adminConfigForm.pikpak_encoded_token" placeholder="如果使用 encoded token 可填写这里" /></label>
+          <label>
+            <span>离线下载失败重试次数</span>
+            <input v-model.number="adminConfigForm.pikpak_offline_retry_count" type="number" min="0" max="5" step="1" placeholder="1" />
+            <small>PikPak 任务报错或健康检查失败时自动重试的次数；超过后标记为失败，需在“失败任务”页手动重试。</small>
+          </label>
         </div>
       </section>
       <section v-else-if="adminConfigForm.storage_provider === 'drive115'">
@@ -398,8 +410,19 @@ async function confirmDeleteEpisode() {
       <section>
         <h3>Mikan 订阅配置</h3>
         <div class="config-grid">
-          <label class="wide"><span>RSS 地址</span><input v-model.trim="adminConfigForm.rss" placeholder="https://mikanani.me/RSS/..." /></label>
-          <label><span>Mikan 用户名（可选）</span><input v-model.trim="adminConfigForm.mikan_username" autocomplete="username" placeholder="用于一键订阅" /></label>
+          <label class="wide">
+            <span>RSS 地址</span>
+            <div class="rss-row">
+              <input v-model.trim="adminConfigForm.rss" placeholder="https://mikanani.me/RSS/..." />
+              <button type="button" class="ghost"
+                      :disabled="discoveringRSS || !adminConfigForm.mikan_username || !adminConfigForm.mikan_password"
+                      @click="discoverMikanRSS">
+                {{ discoveringRSS ? '获取中...' : (adminConfigForm.rss ? '重新获取' : '自动获取') }}
+              </button>
+            </div>
+            <small>填好下方 Mikan 用户名密码后点击按钮，系统会代你登录并抓取个人 RSS。保存配置时若 RSS 为空也会自动尝试一次。</small>
+          </label>
+          <label><span>Mikan 用户名（可选）</span><input v-model.trim="adminConfigForm.mikan_username" autocomplete="username" placeholder="用于一键订阅与抓取个人 RSS" /></label>
           <label><span>Mikan 密码（可选）</span><input v-model="adminConfigForm.mikan_password" type="password" autocomplete="current-password" placeholder="可留空" /></label>
         </div>
       </section>
@@ -409,6 +432,54 @@ async function confirmDeleteEpisode() {
     </form>
   </section>
 
+
+  <section v-else-if="adminTab === 'failed'" class="admin-panel admin-failed-panel">
+    <div class="section-title">
+      <h2>失败任务</h2>
+      <span>{{ failedEpisodes.length }} 条</span>
+      <div class="section-title-actions">
+        <button type="button" class="ghost" :disabled="syncing" @click="syncRSS">
+          {{ syncing ? '同步中...' : '立即同步 RSS' }}
+        </button>
+        <button type="button" class="ghost" :disabled="refreshingPikPak" @click="refreshPikPakNow">
+          {{ refreshingPikPak ? '刷新中...' : '立即刷新 PikPak 状态' }}
+        </button>
+        <button type="button" class="primary" :disabled="failedEpisodesRetrying || !failedEpisodes.length" @click="retryAllFailedEpisodes">
+          {{ failedEpisodesRetrying ? '重试中...' : '全部重试' }}
+        </button>
+      </div>
+    </div>
+    <div v-if="failedEpisodesLoading" class="empty-state">加载中...</div>
+    <div v-else-if="!failedEpisodes.length" class="empty-state">暂无失败任务。</div>
+    <table v-else class="failed-table">
+      <thead>
+        <tr>
+          <th>番剧</th>
+          <th>集数</th>
+          <th>失败原因</th>
+          <th>失败时间</th>
+          <th>已重试</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="row in failedEpisodes" :key="row.bangumi_title + '\x00' + row.label">
+          <td class="primary-col">{{ row.bangumi_title }}</td>
+          <td>{{ row.label }}</td>
+          <td class="reason-col" :title="row.failed_reason">{{ row.failed_reason || '—' }}</td>
+          <td>{{ formatChinaTime(row.failed_at) }}</td>
+          <td>{{ row.retry_count }}</td>
+          <td>
+            <button type="button" class="ghost"
+                    :disabled="failedEpisodesRetryingRow === (row.bangumi_title + '\x00' + row.label)"
+                    @click="retryFailedEpisode(row)">
+              {{ failedEpisodesRetryingRow === (row.bangumi_title + '\x00' + row.label) ? '重试中...' : '重试' }}
+            </button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
 
   <section v-else-if="adminTab === 'config'" class="admin-panel admin-config-panel">
     <div class="section-title"><h2>系统配置</h2></div>
@@ -452,6 +523,7 @@ async function confirmDeleteEpisode() {
       <article><span>Redis</span><strong :class="{ good: adminMonitor.redis_ready }">{{ statusText(adminMonitor.redis_ready) }}</strong></article>
       <article><span>储存桶</span><strong :class="{ good: adminMonitor.storage_ready }">{{ adminMonitor.storage_provider || '未配置' }} · {{ statusText(adminMonitor.storage_ready) }}</strong></article>
       <article><span>代理</span><strong :class="{ good: adminMonitor.proxy_enabled }">{{ adminMonitor.proxy_enabled ? '已启用' : '未启用' }}</strong></article>
+      <article><span>失败任务</span><strong :class="{ good: failedEpisodes.length === 0 }">{{ failedEpisodes.length }} 条 <button v-if="failedEpisodes.length" class="ghost-link" @click="switchAdminTab('failed')">查看</button></strong></article>
     </div>
   </section>
   </div>

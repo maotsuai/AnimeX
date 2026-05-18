@@ -40,21 +40,22 @@ type PikPakClient interface {
 }
 
 type Server struct {
-	Config       config.Config
-	ConfigPath   string
-	ConfigDBPath string
-	LocalDB      *config.LocalDB
-	InstallOnly  bool
-	Sessions     *SessionStore
-	Runtime      *RuntimeState
-	HTTPClient   *http.Client
-	Logger       *slog.Logger
-	TorrentRoot  string
-	StaticDir    string
-	PikPak       PikPakClient
-	Storage      storage.Provider
-	Store        *store.MySQLStore
-	Cache        *cache.RedisCache
+	Config        config.Config
+	ConfigPath    string
+	ConfigDBPath  string
+	LocalDB       *config.LocalDB
+	InstallOnly   bool
+	Sessions      *SessionStore
+	Runtime       *RuntimeState
+	HTTPClient    *http.Client
+	Logger        *slog.Logger
+	TorrentRoot   string
+	StaticDir     string
+	PikPak        PikPakClient
+	Storage       storage.Provider
+	Store         *store.MySQLStore
+	Cache         *cache.RedisCache
+	PollerTrigger chan struct{}
 }
 
 type downloadRequest struct {
@@ -147,6 +148,11 @@ func (s Server) Handler() http.Handler {
 	if s.Runtime == nil {
 		s.Runtime = NewRuntimeState(s.Config, installed, s.InstallOnly, s.HTTPClient, s.PikPak, s.Storage, s.Store, s.Cache)
 	}
+	if s.Runtime.PollerTrigger == nil && s.PollerTrigger != nil {
+		s.Runtime.mu.Lock()
+		s.Runtime.PollerTrigger = s.PollerTrigger
+		s.Runtime.mu.Unlock()
+	}
 	s.Sessions.SetRedis(s.redisCache())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -165,6 +171,10 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/api/admin/monitor", s.handleAdminMonitor)
 	mux.HandleFunc("/api/admin/config", s.handleAdminConfig)
 	mux.HandleFunc("/api/admin/invite-codes", s.handleAdminInviteCodes)
+	mux.HandleFunc("/api/admin/failed-episodes", s.handleAdminFailedEpisodes)
+	mux.HandleFunc("/api/admin/retry-episode", s.handleAdminRetryEpisode)
+	mux.HandleFunc("/api/admin/retry-failed-all", s.handleAdminRetryFailedAll)
+	mux.HandleFunc("/api/admin/refresh-pikpak", s.handleAdminRefreshPikPak)
 	mux.HandleFunc("/api/install", s.handleInstall)
 	mux.HandleFunc("/api/install/status", s.handleInstallStatus)
 	mux.HandleFunc("/api/install/test/mysql", s.handleInstallTestMySQL)
@@ -175,6 +185,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/api/bangumi/discover", s.handleBangumiDiscover)
 	mux.HandleFunc("/api/mikan/schedule", s.handleMikanSchedule)
 	mux.HandleFunc("/api/mikan/subscribe", s.handleMikanSubscribe)
+	mux.HandleFunc("/api/mikan/discover-rss", s.handleMikanDiscoverRSS)
 	mux.HandleFunc("/api/download", s.handleDownload)
 	mux.HandleFunc("/api/download/request", s.handleDownloadRequest)
 	mux.HandleFunc("/api/sync", s.handleSync)
@@ -906,6 +917,14 @@ func (s Server) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg := mergeAdminEditableConfig(current, incoming)
+		if strings.TrimSpace(cfg.RSS) == "" && cfg.MikanConfigured() {
+			if discovered, err := s.tryDiscoverRSSInline(r.Context(), cfg); err == nil && discovered != "" {
+				cfg.RSS = discovered
+				s.log().Info("mikan personal rss auto-discovered on config save")
+			} else if err != nil {
+				s.log().Warn("mikan personal rss auto-discover failed; admin can retry via 重新获取", "error", err)
+			}
+		}
 		if err := cfg.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -1035,6 +1054,7 @@ func adminEditableConfig(cfg config.Config) map[string]any {
 		"aria2_rpc_secret":          cfg.Aria2RPCSecret,
 		"local_storage_path":        cfg.LocalStoragePath,
 		"nas_storage_path":          cfg.NASStoragePath,
+		"pikpak_offline_retry_count": cfg.PikPakOfflineRetryCount,
 	}
 }
 
@@ -1060,7 +1080,152 @@ func mergeAdminEditableConfig(current, incoming config.Config) config.Config {
 	current.Aria2RPCSecret = incoming.Aria2RPCSecret
 	current.LocalStoragePath = firstNonEmpty(incoming.LocalStoragePath, current.LocalStoragePath, config.Default().LocalStoragePath)
 	current.NASStoragePath = incoming.NASStoragePath
+	if incoming.PikPakOfflineRetryCount < 0 {
+		current.PikPakOfflineRetryCount = 0
+	} else if incoming.PikPakOfflineRetryCount > 10 {
+		current.PikPakOfflineRetryCount = 10
+	} else {
+		current.PikPakOfflineRetryCount = incoming.PikPakOfflineRetryCount
+	}
 	return installConfigWithDefaults(current)
+}
+
+func (s Server) handleAdminFailedEpisodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeError(w, http.StatusMethodNotAllowed, errors.New("请求方法不允许"))
+		return
+	}
+	st := s.store()
+	if st == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+		return
+	}
+	items, err := st.ListFailedEpisodes(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type adminRetryEpisodeRequest struct {
+	BangumiTitle string `json:"bangumi_title"`
+	EpisodeLabel string `json:"episode_label"`
+}
+
+func (s Server) handleAdminRetryEpisode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, errors.New("请求方法不允许"))
+		return
+	}
+	var req adminRetryEpisodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	req.BangumiTitle = strings.TrimSpace(req.BangumiTitle)
+	req.EpisodeLabel = strings.TrimSpace(req.EpisodeLabel)
+	if req.BangumiTitle == "" || req.EpisodeLabel == "" {
+		writeError(w, http.StatusBadRequest, errors.New("番剧标题和集数标签不能为空"))
+		return
+	}
+	if err := s.retryFailedEpisode(r.Context(), req.BangumiTitle, req.EpisodeLabel); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "重试已提交"})
+}
+
+func (s Server) handleAdminRetryFailedAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, errors.New("请求方法不允许"))
+		return
+	}
+	st := s.store()
+	if st == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "succeeded": 0, "failed": 0})
+		return
+	}
+	items, err := st.ListFailedEpisodes(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	succeeded, failed := 0, 0
+	for _, ep := range items {
+		if err := s.retryFailedEpisode(r.Context(), ep.BangumiTitle, ep.Label); err != nil {
+			s.log().Warn("admin: retry failed episode failed", "bangumi", ep.BangumiTitle, "episode", ep.Label, "error", err)
+			failed++
+			continue
+		}
+		succeeded++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "succeeded": succeeded, "failed": failed})
+}
+
+func (s Server) handleAdminRefreshPikPak(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, errors.New("请求方法不允许"))
+		return
+	}
+	if s.Runtime != nil {
+		s.Runtime.mu.RLock()
+		ch := s.Runtime.PollerTrigger
+		s.Runtime.mu.RUnlock()
+		app.TriggerPoller(ch)
+	} else if s.PollerTrigger != nil {
+		app.TriggerPoller(s.PollerTrigger)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已请求立即刷新 PikPak 状态"})
+}
+
+// retryFailedEpisode resets a failed episode row to 'pending' and runs a
+// single-entry RunOnce that resubmits the original torrent_url.
+func (s Server) retryFailedEpisode(ctx context.Context, title, label string) error {
+	st := s.store()
+	if st == nil {
+		return errors.New("MySQL 未初始化")
+	}
+	rec, ok, err := st.FindFailedEpisode(ctx, title, label)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("未找到失败任务：%s / %s", title, label)
+	}
+	if strings.TrimSpace(rec.TorrentURL) == "" {
+		return errors.New("失败任务缺少 torrent_url，无法自动重试，请通过手动下载提交")
+	}
+	if err := st.ResetEpisodeForRetry(ctx, title, label); err != nil {
+		return err
+	}
+	provider := s.storageProvider()
+	if provider == nil {
+		return errors.New("储存桶未初始化")
+	}
+	cfg := s.runtimeConfig()
+	runner := app.Runner{
+		Config:      cfg,
+		HTTPClient:  s.httpClient(),
+		Logger:      s.log(),
+		TorrentRoot: s.torrentRoot(),
+		PikPak:      s.pikpakClient(),
+		Storage:     provider,
+		Store:       s.store(),
+		Strict:      true,
+		EntriesFunc: func(context.Context) ([]app.ResolvedEntry, error) {
+			return []app.ResolvedEntry{{
+				Entry:        rss.Entry{Title: rec.BangumiTitle, TorrentURL: rec.TorrentURL},
+				BangumiTitle: rec.BangumiTitle,
+				EpisodeLabel: rec.Label,
+			}}, nil
+		},
+	}
+	return runner.RunOnce(ctx)
 }
 
 func (s Server) handleAdminMonitor(w http.ResponseWriter, r *http.Request) {
@@ -1629,6 +1794,60 @@ func (s Server) handleMikanSubscribe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已在 Mikan 订阅", "mikan_bangumi": candidate})
 }
 
+func (s Server) handleMikanDiscoverRSS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, errors.New("请求方法不允许"))
+		return
+	}
+	cfg := s.runtimeConfig()
+	url, err := s.tryDiscoverRSSInline(r.Context(), cfg)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	if url == "" {
+		writeError(w, http.StatusBadGateway, errors.New("未找到 Mikan 个人 RSS 地址，请手动粘贴"))
+		return
+	}
+	cfg.RSS = url
+	if s.LocalDB == nil {
+		db, err := config.OpenLocalDB(s.configDBPath())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.LocalDB = db
+	}
+	if err := s.LocalDB.SaveConfig(r.Context(), cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.reloadRuntime(r.Context(), cfg); err != nil {
+		s.log().Warn("reload runtime after RSS discover failed", "error", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rss": url, "message": "已抓取 Mikan 个人 RSS 地址"})
+}
+
+// tryDiscoverRSSInline performs a Mikan login + RSS scrape using the
+// credentials in cfg and returns the discovered URL verbatim. Empty string
+// + nil error means "no URL found on the candidate pages but no error
+// either" — the caller decides whether to treat that as fatal.
+func (s Server) tryDiscoverRSSInline(ctx context.Context, cfg config.Config) (string, error) {
+	if !cfg.MikanConfigured() {
+		return "", errors.New("请先填写 Mikan 用户名和密码")
+	}
+	client := mikan.NewSession(s.httpClient())
+	if err := mikan.Login(client, cfg.MikanUsername, cfg.MikanPassword); err != nil {
+		return "", fmt.Errorf("登录 Mikan 失败：%w", err)
+	}
+	url, err := mikan.FetchPersonalRSS(client)
+	if err != nil {
+		return "", fmt.Errorf("抓取 Mikan 个人 RSS 失败：%w", err)
+	}
+	return url, nil
+}
+
 func (s Server) applyStoredLibraryMetadata(ctx context.Context, lib *LibraryResponse) error {
 	st := s.store()
 	if st == nil || lib == nil {
@@ -1774,6 +1993,7 @@ func (s Server) submitDownloadToStorage(ctx context.Context, req downloadRequest
 		HTTPClient:  s.httpClient(),
 		Logger:      s.log(),
 		TorrentRoot: s.torrentRoot(),
+		PikPak:      s.pikpakClient(),
 		Storage:     provider,
 		Store:       s.store(),
 		Strict:      true,
@@ -1895,7 +2115,7 @@ func (s Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, errors.New("储存桶未初始化"))
 		return
 	}
-	runner := app.Runner{Config: s.runtimeConfig(), HTTPClient: s.httpClient(), Logger: s.log(), TorrentRoot: s.torrentRoot(), Storage: provider, Store: s.store()}
+	runner := app.Runner{Config: s.runtimeConfig(), HTTPClient: s.httpClient(), Logger: s.log(), TorrentRoot: s.torrentRoot(), PikPak: s.pikpakClient(), Storage: provider, Store: s.store()}
 	if err := runner.RunOnce(r.Context()); err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -2237,7 +2457,7 @@ func (s Server) adminOnlyAPI(r *http.Request) bool {
 		return true
 	}
 	switch r.URL.Path {
-	case "/api/download", "/api/sync", "/api/mikan/subscribe", "/api/users":
+	case "/api/download", "/api/sync", "/api/mikan/subscribe", "/api/mikan/discover-rss", "/api/users":
 		return true
 	case "/api/library":
 		return r.URL.Query().Get("refresh") == "1"

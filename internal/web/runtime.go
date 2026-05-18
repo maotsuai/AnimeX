@@ -11,15 +11,16 @@ import (
 )
 
 type RuntimeState struct {
-	mu          sync.RWMutex
-	Config      config.Config
-	Installed   bool
-	InstallOnly bool
-	HTTPClient  *http.Client
-	PikPak      PikPakClient
-	Storage     storage.Provider
-	Store       *store.MySQLStore
-	Cache       *cache.RedisCache
+	mu            sync.RWMutex
+	Config        config.Config
+	Installed     bool
+	InstallOnly   bool
+	HTTPClient    *http.Client
+	PikPak        PikPakClient
+	Storage       storage.Provider
+	Store         *store.MySQLStore
+	Cache         *cache.RedisCache
+	PollerTrigger chan struct{}
 }
 
 func NewRuntimeState(cfg config.Config, installed, installOnly bool, httpClient *http.Client, pikpak PikPakClient, storageProvider storage.Provider, mysqlStore *store.MySQLStore, redisCache *cache.RedisCache) *RuntimeState {

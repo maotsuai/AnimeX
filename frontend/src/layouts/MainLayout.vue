@@ -63,6 +63,12 @@ const adminDownloadRequests = ref([])
 const adminLogs = ref([])
 const adminMonitor = ref({})
 const adminConfigSaving = ref(false)
+const discoveringRSS = ref(false)
+const failedEpisodes = ref([])
+const failedEpisodesLoading = ref(false)
+const failedEpisodesRetrying = ref(false)
+const failedEpisodesRetryingRow = ref('')
+const refreshingPikPak = ref(false)
 const adminConfigForm = ref({
   username: '',
   password: '',
@@ -85,6 +91,7 @@ const adminConfigForm = ref({
   aria2_rpc_secret: '',
   local_storage_path: 'downloads',
   nas_storage_path: '',
+  pikpak_offline_retry_count: 1,
 })
 const adminTabTitle = computed(() => ({
   overview: '数据概览',
@@ -94,6 +101,7 @@ const adminTabTitle = computed(() => ({
   logs: '日志管理',
   monitor: '系统监控',
   config: '系统配置',
+  failed: '失败任务',
 }[adminTab.value] || '管理员面板'))
 const adminUserForm = ref({ username: '', password: '', role: 'user' })
 const toast = ref('')
@@ -775,8 +783,12 @@ async function loadAdminPanel(tab = adminTab.value) {
       else await loadAdminAnime()
     }
     if (tab === 'logs') await loadAdminLogs()
-    if (tab === 'monitor') await loadAdminMonitor()
+    if (tab === 'monitor') {
+      await loadAdminMonitor()
+      await loadFailedEpisodes()
+    }
     if (tab === 'config' || tab === 'storage') await loadAdminConfig()
+    if (tab === 'failed') await loadFailedEpisodes()
   } catch (error) {
     if (isAuthError(error)) {
       leaveAdminAfterAuthFailure(error.status === 403 ? '当前账号不是管理员，已返回主页' : '管理员登录已失效，已返回主页')
@@ -955,10 +967,91 @@ async function loadAdminConfig() {
   adminConfigForm.value.aria2_rpc_url = adminConfigForm.value.aria2_rpc_url || 'http://127.0.0.1:6800/jsonrpc'
   adminConfigForm.value.local_storage_path = adminConfigForm.value.local_storage_path || 'downloads'
   adminConfigForm.value.user_daily_download_limit = Number(adminConfigForm.value.user_daily_download_limit ?? 3)
+  adminConfigForm.value.pikpak_offline_retry_count = Number(adminConfigForm.value.pikpak_offline_retry_count ?? 1)
   requireLogin.value = adminConfigForm.value.require_login !== undefined ? Boolean(adminConfigForm.value.require_login) : true
   registerStatus.value = {
     enable_registration: adminConfigForm.value.enable_registration !== undefined ? Boolean(adminConfigForm.value.enable_registration) : true,
     require_invite: adminConfigForm.value.require_invite !== undefined ? Boolean(adminConfigForm.value.require_invite) : false,
+  }
+}
+
+async function loadFailedEpisodes() {
+  failedEpisodesLoading.value = true
+  try {
+    const data = await api('/api/admin/failed-episodes')
+    failedEpisodes.value = Array.isArray(data.items) ? data.items : []
+  } catch (error) {
+    notify('加载失败任务失败：' + error.message, true)
+    failedEpisodes.value = []
+  } finally {
+    failedEpisodesLoading.value = false
+  }
+}
+
+async function retryFailedEpisode(row) {
+  if (!row || failedEpisodesRetryingRow.value) return
+  const key = (row.bangumi_title || '') + '\x00' + (row.label || '')
+  failedEpisodesRetryingRow.value = key
+  try {
+    await api('/api/admin/retry-episode', {
+      method: 'POST',
+      body: JSON.stringify({ bangumi_title: row.bangumi_title, episode_label: row.label }),
+    })
+    notify('已提交重试：' + row.bangumi_title + ' / ' + row.label)
+    await loadFailedEpisodes()
+  } catch (error) {
+    notify('重试失败：' + error.message, true)
+  } finally {
+    failedEpisodesRetryingRow.value = ''
+  }
+}
+
+async function retryAllFailedEpisodes() {
+  if (failedEpisodesRetrying.value) return
+  failedEpisodesRetrying.value = true
+  try {
+    const data = await api('/api/admin/retry-failed-all', { method: 'POST', body: '{}' })
+    notify(`批量重试完成：成功 ${data.succeeded || 0} 条，失败 ${data.failed || 0} 条`)
+    await loadFailedEpisodes()
+  } catch (error) {
+    notify('批量重试失败：' + error.message, true)
+  } finally {
+    failedEpisodesRetrying.value = false
+  }
+}
+
+async function refreshPikPakNow() {
+  if (refreshingPikPak.value) return
+  refreshingPikPak.value = true
+  try {
+    await api('/api/admin/refresh-pikpak', { method: 'POST', body: '{}' })
+    notify('已请求立即刷新 PikPak 状态')
+  } catch (error) {
+    notify('刷新失败：' + error.message, true)
+  } finally {
+    refreshingPikPak.value = false
+  }
+}
+
+async function discoverMikanRSS() {
+  if (discoveringRSS.value) return
+  if (!adminConfigForm.value.mikan_username || !adminConfigForm.value.mikan_password) {
+    notify('请先填写 Mikan 用户名和密码', true)
+    return
+  }
+  discoveringRSS.value = true
+  try {
+    const data = await api('/api/mikan/discover-rss', { method: 'POST', body: '{}' })
+    if (data.rss) {
+      adminConfigForm.value.rss = data.rss
+      notify(data.message || '已抓取 Mikan 个人 RSS 地址')
+    } else {
+      notify('未找到 Mikan 个人 RSS 地址', true)
+    }
+  } catch (error) {
+    notify('抓取 Mikan RSS 失败：' + error.message, true)
+  } finally {
+    discoveringRSS.value = false
   }
 }
 
@@ -972,6 +1065,7 @@ async function saveAdminConfig() {
     adminConfigForm.value.aria2_rpc_url = adminConfigForm.value.aria2_rpc_url || 'http://127.0.0.1:6800/jsonrpc'
     adminConfigForm.value.local_storage_path = adminConfigForm.value.local_storage_path || 'downloads'
     adminConfigForm.value.user_daily_download_limit = Number(adminConfigForm.value.user_daily_download_limit ?? 3)
+  adminConfigForm.value.pikpak_offline_retry_count = Number(adminConfigForm.value.pikpak_offline_retry_count ?? 1)
     requireLogin.value = adminConfigForm.value.require_login !== undefined ? Boolean(adminConfigForm.value.require_login) : true
     registerStatus.value = {
       enable_registration: adminConfigForm.value.enable_registration !== undefined ? Boolean(adminConfigForm.value.enable_registration) : true,
@@ -1145,6 +1239,10 @@ provide('animeX', {
   adminOverview, formatStorage, adminUsers, adminSavingUser, adminUserForm, saveAdminUser,
   adminInvites, adminInviteLoading, generateInviteCodes, deleteInviteCodes,
   adminAnime, adminDownloadRequests, approveDownloadRequest, placeholder, adminLogs, adminConfigForm, saveAdminConfig, adminConfigSaving, deleteAdminAnime, deleteAdminEpisode,
+  discoveringRSS, discoverMikanRSS,
+  failedEpisodes, failedEpisodesLoading, failedEpisodesRetrying, failedEpisodesRetryingRow,
+  loadFailedEpisodes, retryFailedEpisode, retryAllFailedEpisodes,
+  refreshingPikPak, refreshPikPakNow,
   adminMonitor, statusText, goHome, authUser, logout, openPasswordModal,
   installSteps, installActiveStep, installDone, installLoading, installPage, installForm,
   installTesting, installTestResults, testInstallConnection, installWriteStage, installWriteSteps,
@@ -1157,6 +1255,7 @@ provide('animeX', {
   discoverTitle, loadDiscover, discovering, discoverSection, discoverTag, openDiscover, discover,
   loadMoreDiscover, discoverHasMore,
   searchQuery, search, searching, results, downloading, downloadStatuses, download,
+  syncRSS, syncing,
   schedule, scheduleLoading, loadSchedule, subscribing, subscribeSubject,
   historyItems, clearHistory, openHistoryItem,
   selected, openPlayer, currentEpisode, selectEpisode,

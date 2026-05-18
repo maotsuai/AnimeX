@@ -715,6 +715,28 @@ button { border: 0; cursor: pointer; color: inherit; }
 .config-grid input:focus, .config-grid select:focus { border-color: rgba(138,98,255,.70); box-shadow: 0 0 0 3px rgba(138,98,255,.12); }
 .config-grid input::placeholder { color: #737a8c; }
 .config-grid small { color: #8f96a7; font-size: 12px; font-weight: 600; line-height: 1.5; }
+.config-grid .rss-row { display: flex; gap: 8px; align-items: center; }
+.config-grid .rss-row input { flex: 1 1 auto; min-width: 0; }
+.config-grid .rss-row button { flex: 0 0 auto; height: 40px; padding: 0 14px; border-radius: 8px; border: 1px solid rgba(138,98,255,.40); background: rgba(138,98,255,.10); color: #cfc8ff; font-weight: 800; cursor: pointer; }
+.config-grid .rss-row button:disabled { opacity: .55; cursor: not-allowed; }
+.config-grid .rss-row button:not(:disabled):hover { background: rgba(138,98,255,.18); }
+.admin-side-badge { background: #b62433; color: #fff; border-radius: 999px; padding: 2px 8px; font-size: 11px; font-weight: 800; font-style: normal; }
+.admin-failed-panel .section-title { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.admin-failed-panel .section-title-actions { margin-left: auto; display: flex; gap: 10px; }
+.admin-failed-panel .section-title-actions button { height: 36px; padding: 0 14px; border-radius: 8px; border: 1px solid rgba(138,98,255,.40); background: rgba(138,98,255,.10); color: #cfc8ff; font-weight: 800; cursor: pointer; }
+.admin-failed-panel .section-title-actions button.primary { background: rgba(228,76,93,.16); border-color: rgba(228,76,93,.50); color: #ffc6cc; }
+.admin-failed-panel .section-title-actions button:disabled { opacity: .55; cursor: not-allowed; }
+.failed-table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #141822; border-radius: 12px; overflow: hidden; }
+.failed-table thead { background: #1b202b; color: #cfd4e2; font-size: 12px; }
+.failed-table th, .failed-table td { padding: 12px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 13px; color: #dfe3ee; }
+.failed-table tbody tr:last-child td { border-bottom: 0; }
+.failed-table .primary-col { font-weight: 800; color: #f2f4fb; }
+.failed-table .reason-col { max-width: 360px; word-break: break-word; color: #ffb1b8; }
+.failed-table button { padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(138,98,255,.40); background: rgba(138,98,255,.10); color: #cfc8ff; font-weight: 700; cursor: pointer; }
+.failed-table button:disabled { opacity: .55; cursor: not-allowed; }
+.failed-table button:not(:disabled):hover { background: rgba(138,98,255,.18); }
+.monitor-grid .ghost-link { margin-left: 8px; padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(138,98,255,.40); background: transparent; color: #cfc8ff; font-size: 12px; font-weight: 700; cursor: pointer; }
+.monitor-grid .ghost-link:hover { background: rgba(138,98,255,.10); }
 .admin-config-form footer { display: flex; justify-content: flex-end; align-items: center; gap: 16px; padding: 4px 2px 0; }
 .admin-config-form footer p { margin: 0; color: #9aa1b1; font-size: 12px; }
 .admin-config-form footer b { color: #cfc8ff; }

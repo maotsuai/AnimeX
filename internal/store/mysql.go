@@ -131,6 +131,73 @@ func (s *MySQLStore) EnsureSchema(ctx context.Context) error {
 			return fmt.Errorf("ensure mysql schema: %w", err)
 		}
 	}
+	episodeColumns := []struct{ name, def string }{
+		{"status", "VARCHAR(32) NOT NULL DEFAULT 'pending'"},
+		{"pikpak_task_id", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"pikpak_file_id", "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{"submitted_at", "TIMESTAMP NULL"},
+		{"failed_at", "TIMESTAMP NULL"},
+		{"failed_reason", "VARCHAR(512) NOT NULL DEFAULT ''"},
+		{"retry_count", "INT NOT NULL DEFAULT 0"},
+		{"health_checked_at", "TIMESTAMP NULL"},
+		{"health_status", "VARCHAR(16) NOT NULL DEFAULT ''"},
+	}
+	for _, col := range episodeColumns {
+		if err := s.ensureColumn(ctx, "episodes", col.name, col.def); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureIndex(ctx, "episodes", "idx_episodes_status", "status"); err != nil {
+		return err
+	}
+	if err := s.ensureIndex(ctx, "episodes", "idx_episodes_pikpak_task_id", "pikpak_task_id"); err != nil {
+		return err
+	}
+	// Backfill: legacy rows that were marked downloaded the moment SubmitDownload
+	// returned (the v1 lie) become 'completed'. Idempotent — only touches rows
+	// still in the default 'pending' status.
+	if _, err := s.db.ExecContext(ctx, `UPDATE episodes SET status='completed' WHERE downloaded_at IS NOT NULL AND status='pending'`); err != nil {
+		return fmt.Errorf("backfill episode status: %w", err)
+	}
+	return nil
+}
+
+// ensureColumn adds a column to the given table if it does not already exist.
+// MySQL 5.7 does not support ADD COLUMN IF NOT EXISTS, so we probe
+// INFORMATION_SCHEMA first.
+func (s *MySQLStore) ensureColumn(ctx context.Context, table, column, definition string) error {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+		table, column).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("probe %s.%s: %w", table, column, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+func (s *MySQLStore) ensureIndex(ctx context.Context, table, indexName, columns string) error {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+		 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?`,
+		table, indexName).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("probe %s.%s: %w", table, indexName, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("CREATE INDEX %s ON %s (%s)", indexName, table, columns)); err != nil {
+		return fmt.Errorf("create %s.%s: %w", table, indexName, err)
+	}
 	return nil
 }
 
@@ -170,15 +237,21 @@ func (s *MySQLStore) Metadata(ctx context.Context, title string) (BangumiRecord,
 	return rec, true, nil
 }
 
+// EpisodeProcessed reports whether an episode is already in flight or done.
+// 'failed' rows are NOT considered processed — admin must explicitly retry
+// from the failed-episodes dashboard.
 func (s *MySQLStore) EpisodeProcessed(ctx context.Context, title, label string) (bool, error) {
 	if s == nil {
 		return false, nil
 	}
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id WHERE b.title=? AND e.label=? AND e.downloaded_at IS NOT NULL`, strings.TrimSpace(title), strings.TrimSpace(label)).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id WHERE b.title=? AND e.label=? AND e.status IN ('submitted','downloading','completed')`, strings.TrimSpace(title), strings.TrimSpace(label)).Scan(&n)
 	return n > 0, err
 }
 
+// MarkEpisodeDownloaded retains the legacy "completed" semantics for the
+// no-PikPak no-Poller code paths (e.g. local + aria2 storage providers).
+// PikPak callers should use MarkEpisodeSubmitted + UpdateEpisodePhaseByTaskID.
 func (s *MySQLStore) MarkEpisodeDownloaded(ctx context.Context, title, label, folderID, torrentURL string) error {
 	if s == nil {
 		return nil
@@ -186,13 +259,300 @@ func (s *MySQLStore) MarkEpisodeDownloaded(ctx context.Context, title, label, fo
 	if err := s.UpsertBangumi(ctx, BangumiRecord{Title: title}); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO episodes (bangumi_id, label, pikpak_folder_id, torrent_url, downloaded_at)
-		SELECT id, ?, ?, NULLIF(?, ''), NOW() FROM bangumi WHERE title=?
+	_, err := s.db.ExecContext(ctx, `INSERT INTO episodes (bangumi_id, label, pikpak_folder_id, torrent_url, status, downloaded_at)
+		SELECT id, ?, ?, NULLIF(?, ''), 'completed', NOW() FROM bangumi WHERE title=?
 		ON DUPLICATE KEY UPDATE
 			episodes.pikpak_folder_id=IF(VALUES(pikpak_folder_id)<>'',VALUES(pikpak_folder_id),episodes.pikpak_folder_id),
 			episodes.torrent_url=IF(VALUES(torrent_url) IS NOT NULL,VALUES(torrent_url),episodes.torrent_url),
+			episodes.status='completed',
 			episodes.downloaded_at=NOW()`, strings.TrimSpace(label), strings.TrimSpace(folderID), strings.TrimSpace(torrentURL), strings.TrimSpace(title))
 	return err
+}
+
+// MarkEpisodeSubmitted is the new submit-time write. Sets status='submitted'
+// and stores the PikPak task ID. The Poller is responsible for transitioning
+// this row to 'completed' or 'failed'.
+func (s *MySQLStore) MarkEpisodeSubmitted(ctx context.Context, title, label, folderID, torrentURL, taskID string) error {
+	if s == nil {
+		return nil
+	}
+	if err := s.UpsertBangumi(ctx, BangumiRecord{Title: title}); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO episodes (bangumi_id, label, pikpak_folder_id, torrent_url, status, pikpak_task_id, submitted_at, retry_count, failed_at, failed_reason, health_checked_at, health_status)
+		SELECT id, ?, ?, NULLIF(?, ''), 'submitted', ?, NOW(), 0, NULL, '', NULL, '' FROM bangumi WHERE title=?
+		ON DUPLICATE KEY UPDATE
+			episodes.pikpak_folder_id=IF(VALUES(pikpak_folder_id)<>'',VALUES(pikpak_folder_id),episodes.pikpak_folder_id),
+			episodes.torrent_url=IF(VALUES(torrent_url) IS NOT NULL,VALUES(torrent_url),episodes.torrent_url),
+			episodes.status='submitted',
+			episodes.pikpak_task_id=VALUES(pikpak_task_id),
+			episodes.submitted_at=NOW(),
+			episodes.failed_at=NULL,
+			episodes.failed_reason='',
+			episodes.health_checked_at=NULL,
+			episodes.health_status=''`,
+		strings.TrimSpace(label), strings.TrimSpace(folderID), strings.TrimSpace(torrentURL), strings.TrimSpace(taskID), strings.TrimSpace(title))
+	return err
+}
+
+// UpdateEpisodePhaseByTaskID is the Poller's write path. Idempotent.
+//   newStatus=='completed' → also sets downloaded_at=NOW(), pikpak_file_id=fileID,
+//                            health_checked_at=NOW(), health_status='ok'.
+//   newStatus=='failed'    → also sets failed_at=NOW(), failed_reason=reason.
+//   newStatus=='downloading' → no-op if already 'downloading'.
+func (s *MySQLStore) UpdateEpisodePhaseByTaskID(ctx context.Context, taskID, newStatus, fileID, reason string) error {
+	if s == nil {
+		return nil
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return fmt.Errorf("UpdateEpisodePhaseByTaskID: empty task id")
+	}
+	switch newStatus {
+	case "completed":
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE episodes SET status='completed', downloaded_at=NOW(), pikpak_file_id=NULLIF(?, ''), health_checked_at=NOW(), health_status='ok' WHERE pikpak_task_id=?`,
+			strings.TrimSpace(fileID), taskID)
+		return err
+	case "failed":
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE episodes SET status='failed', failed_at=NOW(), failed_reason=? WHERE pikpak_task_id=?`,
+			truncate(reason, 500), taskID)
+		return err
+	case "downloading":
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE episodes SET status='downloading' WHERE pikpak_task_id=? AND status<>'downloading' AND status<>'completed'`,
+			taskID)
+		return err
+	default:
+		return fmt.Errorf("UpdateEpisodePhaseByTaskID: unknown status %q", newStatus)
+	}
+}
+
+// IncrementEpisodeRetry atomically bumps retry_count and returns the new value.
+func (s *MySQLStore) IncrementEpisodeRetry(ctx context.Context, taskID string) (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return 0, fmt.Errorf("IncrementEpisodeRetry: empty task id")
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE episodes SET retry_count=retry_count+1 WHERE pikpak_task_id=?`, taskID); err != nil {
+		return 0, err
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT retry_count FROM episodes WHERE pikpak_task_id=?`, taskID).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// OpenEpisode is what the Poller works with.
+type OpenEpisode struct {
+	BangumiID      int64
+	Title          string
+	Label          string
+	PikPakFolderID string
+	TorrentURL     string
+	PikPakTaskID   string
+	RetryCount     int
+	SubmittedAt    time.Time
+}
+
+// OpenEpisodes returns all rows that the Poller should refresh.
+func (s *MySQLStore) OpenEpisodes(ctx context.Context) ([]OpenEpisode, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT b.id, b.title, e.label, COALESCE(e.pikpak_folder_id,''), COALESCE(e.torrent_url,''), COALESCE(e.pikpak_task_id,''), e.retry_count, COALESCE(e.submitted_at, NOW())
+		FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		WHERE e.status IN ('submitted','downloading')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OpenEpisode
+	for rows.Next() {
+		var ep OpenEpisode
+		if err := rows.Scan(&ep.BangumiID, &ep.Title, &ep.Label, &ep.PikPakFolderID, &ep.TorrentURL, &ep.PikPakTaskID, &ep.RetryCount, &ep.SubmittedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, ep)
+	}
+	return out, rows.Err()
+}
+
+// UncheckedEpisode is returned for completed episodes that have not yet had
+// a one-time health check.
+type UncheckedEpisode struct {
+	Title          string
+	Label          string
+	PikPakFolderID string
+	PikPakFileID   string
+}
+
+// UncheckedCompletedEpisode returns the row IFF status='completed' AND
+// health_checked_at IS NULL. Used by Runner.RunOnce when it's about to
+// skip a folder that already has children.
+func (s *MySQLStore) UncheckedCompletedEpisode(ctx context.Context, title, label string) (UncheckedEpisode, bool, error) {
+	if s == nil {
+		return UncheckedEpisode{}, false, nil
+	}
+	var ep UncheckedEpisode
+	err := s.db.QueryRowContext(ctx,
+		`SELECT b.title, e.label, COALESCE(e.pikpak_folder_id,''), COALESCE(e.pikpak_file_id,'')
+		 FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 WHERE b.title=? AND e.label=? AND e.status='completed' AND e.health_checked_at IS NULL`,
+		strings.TrimSpace(title), strings.TrimSpace(label)).Scan(&ep.Title, &ep.Label, &ep.PikPakFolderID, &ep.PikPakFileID)
+	if err == sql.ErrNoRows {
+		return UncheckedEpisode{}, false, nil
+	}
+	if err != nil {
+		return UncheckedEpisode{}, false, err
+	}
+	return ep, true, nil
+}
+
+// UncheckedCompletedEpisodeRaw is the flat-field variant used by the
+// app.Runner.RunOnce existing-folder branch (avoids importing this
+// package's struct types into internal/app).
+func (s *MySQLStore) UncheckedCompletedEpisodeRaw(ctx context.Context, title, label string) (string, string, bool, error) {
+	ep, ok, err := s.UncheckedCompletedEpisode(ctx, title, label)
+	if err != nil || !ok {
+		return "", "", ok, err
+	}
+	return ep.PikPakFolderID, ep.PikPakFileID, true, nil
+}
+
+// MarkEpisodeHealthOK records that we've verified the episode's files look
+// healthy. Sets pikpak_file_id if non-empty.
+func (s *MySQLStore) MarkEpisodeHealthOK(ctx context.Context, title, label, fileID string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 SET e.health_checked_at=NOW(), e.health_status='ok',
+		     e.pikpak_file_id=IF(?<>'', ?, e.pikpak_file_id)
+		 WHERE b.title=? AND e.label=?`,
+		strings.TrimSpace(fileID), strings.TrimSpace(fileID), strings.TrimSpace(title), strings.TrimSpace(label))
+	return err
+}
+
+// MarkEpisodeBrokenAndFailed flips a completed episode to 'failed' after a
+// post-hoc health check finds it broken. Used by the cycle's existing-folder
+// branch (we don't auto-resubmit from there because legacy torrent_url may
+// be stale).
+func (s *MySQLStore) MarkEpisodeBrokenAndFailed(ctx context.Context, title, label, reason string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 SET e.status='failed', e.failed_at=NOW(), e.failed_reason=?,
+		     e.health_checked_at=NOW(), e.health_status='broken'
+		 WHERE b.title=? AND e.label=?`,
+		truncate(reason, 500), strings.TrimSpace(title), strings.TrimSpace(label))
+	return err
+}
+
+// MarkEpisodeResubmittedFromBroken is called by the Poller after it renamed
+// a broken file and submitted a fresh PikPak task for the same episode.
+func (s *MySQLStore) MarkEpisodeResubmittedFromBroken(ctx context.Context, title, label, newTaskID, oldFileID, reason string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 SET e.status='submitted', e.pikpak_task_id=?, e.submitted_at=NOW(),
+		     e.retry_count=e.retry_count+1,
+		     e.failed_at=NULL, e.failed_reason=?,
+		     e.health_checked_at=NULL, e.health_status='broken',
+		     e.pikpak_file_id=IF(?<>'', '', e.pikpak_file_id)
+		 WHERE b.title=? AND e.label=?`,
+		strings.TrimSpace(newTaskID), truncate(reason, 500), strings.TrimSpace(oldFileID), strings.TrimSpace(title), strings.TrimSpace(label))
+	return err
+}
+
+// FailedEpisode is returned to the admin dashboard.
+type FailedEpisode struct {
+	BangumiID    int64     `json:"bangumi_id"`
+	BangumiTitle string    `json:"bangumi_title"`
+	Label        string    `json:"label"`
+	TorrentURL   string    `json:"torrent_url"`
+	FailedReason string    `json:"failed_reason"`
+	FailedAt     time.Time `json:"failed_at"`
+	RetryCount   int       `json:"retry_count"`
+}
+
+// ListFailedEpisodes returns all rows currently in 'failed' status.
+func (s *MySQLStore) ListFailedEpisodes(ctx context.Context) ([]FailedEpisode, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT b.id, b.title, e.label, COALESCE(e.torrent_url,''), COALESCE(e.failed_reason,''), COALESCE(e.failed_at, NOW()), e.retry_count
+		 FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 WHERE e.status='failed'
+		 ORDER BY e.failed_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FailedEpisode
+	for rows.Next() {
+		var fe FailedEpisode
+		if err := rows.Scan(&fe.BangumiID, &fe.BangumiTitle, &fe.Label, &fe.TorrentURL, &fe.FailedReason, &fe.FailedAt, &fe.RetryCount); err != nil {
+			return nil, err
+		}
+		out = append(out, fe)
+	}
+	return out, rows.Err()
+}
+
+// FindFailedEpisode looks up one failed row by (title, label) and returns it.
+func (s *MySQLStore) FindFailedEpisode(ctx context.Context, title, label string) (FailedEpisode, bool, error) {
+	if s == nil {
+		return FailedEpisode{}, false, nil
+	}
+	var fe FailedEpisode
+	err := s.db.QueryRowContext(ctx,
+		`SELECT b.id, b.title, e.label, COALESCE(e.torrent_url,''), COALESCE(e.failed_reason,''), COALESCE(e.failed_at, NOW()), e.retry_count
+		 FROM episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 WHERE b.title=? AND e.label=? AND e.status='failed'`,
+		strings.TrimSpace(title), strings.TrimSpace(label)).Scan(&fe.BangumiID, &fe.BangumiTitle, &fe.Label, &fe.TorrentURL, &fe.FailedReason, &fe.FailedAt, &fe.RetryCount)
+	if err == sql.ErrNoRows {
+		return FailedEpisode{}, false, nil
+	}
+	if err != nil {
+		return FailedEpisode{}, false, err
+	}
+	return fe, true, nil
+}
+
+// ResetEpisodeForRetry clears 'failed' state so the cycle / one-shot RunOnce
+// will re-process this episode. retry_count is preserved (acts as a lifetime
+// counter, not a per-attempt budget).
+func (s *MySQLStore) ResetEpisodeForRetry(ctx context.Context, title, label string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE episodes e JOIN bangumi b ON b.id=e.bangumi_id
+		 SET e.status='pending', e.failed_at=NULL, e.failed_reason='',
+		     e.pikpak_task_id='', e.health_checked_at=NULL, e.health_status=''
+		 WHERE b.title=? AND e.label=? AND e.status='failed'`,
+		strings.TrimSpace(title), strings.TrimSpace(label))
+	return err
+}
+
+func truncate(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 func (s *MySQLStore) SaveBangumiMetadata(ctx context.Context, title, coverURL, summary string) error {
