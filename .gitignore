@@ -156,6 +156,7 @@ cython_debug/
 torrent/
 config.json
 CLAUDE.md
+.claude/
 123-dev-doc/
 # Local git worktrees
 .worktrees/
