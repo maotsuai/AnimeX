@@ -12,7 +12,7 @@ AnimeX 是一个基于 **Mikan Project + Bangumi.tv + 多储存桶后端** 的�
 
 
 ---
-
+## 本项目修改了原项目的部分rss获取逻辑，添加了从原rss地址同步媒体库功能（仅pikpak）
 ## 界面预览
 
 ### 首页
@@ -357,29 +357,14 @@ docker logs -f animex
 
 ### 一体化部署（推荐）
 
-仓库自带 `docker-compose.full.yml`，一次性启动 AnimeX + MySQL + Redis，首次运行会自动生成 MySQL / 管理员密码写到 `docker-data/secrets/`。
+> 本fork替换掉了原项目自带的配置文件docker-compose.full.yml，将管理员密码/mysql密码设置放到了.env中，可在.env设置或修改相关密码，修改后需要重建容器，docker-data/secrets内的内容已失效。
+仓库自带 `compose.yml`，一次性启动 AnimeX + MySQL + Redis，首次运行会自动生成 MySQL / 管理员密码写到 `docker-data/secrets/`。
 
 ```bash
 git clone https://github.com/YinBuLiao/AnimeX.git
 cd AnimeX
 docker compose -f docker-compose.full.yml up -d
 docker compose -f docker-compose.full.yml logs -f animex
-```
-
-启动日志末尾会打印随机生成的管理员密码：
-
-```text
-==> AnimeX admin credentials
-    username: admin
-    password: <16 位随机串>
-```
-
-密码同时落盘：
-
-```text
-docker-data/secrets/admin_password.txt
-docker-data/secrets/mysql_password.txt
-docker-data/secrets/mysql_root_password.txt
 ```
 
 访问：
@@ -391,8 +376,8 @@ http://服务器IP:8080
 升级时：
 
 ```bash
-docker compose -f docker-compose.full.yml pull
-docker compose -f docker-compose.full.yml up -d
+docker compose -f compose.yml pull
+docker compose -f compose.yml up -d
 ```
 
 数据保存在宿主机 `docker-data/`，升级镜像不会丢配置 / 历史。
