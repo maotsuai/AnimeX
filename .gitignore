@@ -1,6 +1,9 @@
 # Local release artifacts produced by manual cross-compile / packaging
 release-artifacts/
 
+# Local Go build output (`go build -o bangumi-pikpak .`)
+/bangumi-pikpak
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
